@@ -1,0 +1,358 @@
+import time
+import math
+import tkinter as tk
+from tkinter import ttk
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+
+from inverse_kinematics import inverse_kinematics
+from forward_kinematics import forward_kinematics
+
+
+class IKControlGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Robot 4R - IK Controller")
+        self.root.geometry("400x510")
+
+        # ROS 2 publisher
+        rclpy.init()
+        self.node = Node("ik_control_gui")
+
+        self.publisher = self.node.create_publisher(
+            JointState, "/joint_states", 10
+        )
+
+        self.joint_names = [
+            "joint1", "joint2", "joint3", "joint4"
+        ]
+                # Current joint angles
+        self.angles = [0.0] * 4
+        self.running = True
+
+        # Trajectory state
+        self.start_angles = self.angles.copy()
+        self.target_angles = self.angles.copy()
+
+        self.move_start_time = 0.0
+        self.move_duration = 2.0
+        self.is_moving = False
+        # Joint motion limits (simulation only)
+        # Units: rad/s and rad/s^2
+
+        self.max_velocity = [
+            1.0,  # J1
+            1.0,  # J2
+            1.0,  # J3
+            1.0   # J4
+        ]
+
+        self.max_acceleration = [
+            2.0,  # J1
+            2.0,  # J2
+            2.0,  # J3
+            2.0   # J4
+        ]
+
+        # Target inputs
+        self.entries = {}
+
+        defaults = {
+            "X (m)": "0.20",
+            "Y (m)": "0.10",
+            "Z (m)": "0.15",
+            "Pitch (deg)": "0",
+            "Move Duration (s)": "2.0"
+ 
+        }
+
+        title = ttk.Label(
+            root,
+            text="ROBOT 4R | IK CONTROL",
+            font=("Arial", 16, "bold")
+        )
+        title.pack(pady=15)
+
+        for label, value in defaults.items():
+            frame = ttk.Frame(root)
+            frame.pack(fill="x", padx=30, pady=5)
+
+            ttk.Label(
+                frame, text=label, width=15
+            ).pack(side="left")
+
+            entry = ttk.Entry(frame, width=15)
+            entry.insert(0, value)
+            entry.pack(side="right")
+
+            self.entries[label] = entry
+
+        # IK solution selection
+        ttk.Label(
+            root, text="IK Configuration"
+        ).pack(pady=(15, 5))
+
+        self.solution_mode = tk.StringVar(value="Auto")
+
+        ttk.Combobox(
+            root,
+            textvariable=self.solution_mode,
+            values=["Auto", "1", "2"],
+            state="readonly",
+            width=10
+        ).pack()
+
+        # Control buttons
+        ttk.Button(
+            root,
+            text="Calculate & Move",
+            command=self.move_robot
+        ).pack(pady=15)
+
+        ttk.Button(
+            root,
+            text="Home Position",
+            command=self.home_robot
+        ).pack()
+
+        # Joint results
+        self.result_label = ttk.Label(
+            root,
+            text="J1: 0.00°\nJ2: 0.00°\nJ3: 0.00°\nJ4: 0.00°",
+            font=("Courier", 12),
+            justify="left"
+        )
+        self.result_label.pack(pady=15)
+
+        self.status = tk.StringVar(value="Ready")
+
+        ttk.Label(
+            root,
+            textvariable=self.status,
+            wraplength=350
+        ).pack(pady=5)
+
+        self.root.protocol(
+            "WM_DELETE_WINDOW", self.close
+        )
+
+        # Publish at 10 Hz
+        self.publish_joints()
+
+    def select_ik_solution(self, solutions):
+
+        mode = self.solution_mode.get()
+
+        # Automatic selection
+        if mode == "Auto":
+
+            best_solution = min(
+                solutions,
+                key=lambda solution: math.dist(
+                    self.angles,
+                    solution
+                )
+            )
+
+            return best_solution
+
+        # Manual selection
+        index = int(mode) - 1
+
+        if index >= len(solutions):
+            raise ValueError(
+                f"Only {len(solutions)} valid IK solution(s)."
+            )
+
+        return solutions[index]
+
+    def calculate_safe_duration(
+        self, start_angles, target_angles, requested_duration
+    ):
+
+        required_duration = requested_duration
+
+        for i in range(4):
+
+            delta_q = abs(
+                target_angles[i] - start_angles[i]
+            )
+
+            # Duration required by velocity limit
+            T_velocity = (
+                1.5 * delta_q / self.max_velocity[i]
+            )
+
+            # Duration required by acceleration limit
+            T_acceleration = math.sqrt(
+                6.0 * delta_q / self.max_acceleration[i]
+            )
+
+            required_duration = max(
+                required_duration,
+                T_velocity,
+                T_acceleration
+            )
+
+        return required_duration
+
+    def move_robot(self):
+        try:
+            x = float(self.entries["X (m)"].get())
+            y = float(self.entries["Y (m)"].get())
+            z = float(self.entries["Z (m)"].get())
+            pitch = float(
+                self.entries["Pitch (deg)"].get()
+            )
+
+            if not all(
+                math.isfinite(v)
+                for v in [x, y, z, pitch]
+            ):
+                raise ValueError("Inputs must be finite numbers.")
+
+            phi = math.radians(pitch)
+
+            solutions = inverse_kinematics(
+                x, y, z, phi
+            )
+
+            if not solutions:
+                self.status.set(
+                    "No valid IK solution within joint limits."
+                )
+                return
+
+            # Select IK solution
+            new_angles = self.select_ik_solution(solutions)
+
+            # Verify with FK before publishing
+            fx, fy, fz = forward_kinematics(
+                *new_angles
+            )
+
+            error = math.dist(
+                [x, y, z], [fx, fy, fz]
+            )
+
+            if error > 1e-5:
+                self.status.set("FK verification failed.")
+                return
+
+            # Read and validate movement duration
+            duration = float(
+              self.entries["Move Duration (s)"].get()
+            )
+
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError(
+                      "Move duration must be a positive number."
+                )
+
+            # Initialize trajectory
+            self.start_angles = self.angles.copy()
+            self.target_angles = new_angles.copy()
+
+            # Enforce velocity and acceleration limits
+            safe_duration = self.calculate_safe_duration(
+                self.start_angles,
+                self.target_angles,
+                duration
+            )
+
+            self.move_start_time = time.monotonic()
+            self.move_duration = safe_duration
+            self.is_moving = True
+
+            self.status.set(
+                f"Moving | Requested: {duration:.2f}s "
+                f"| Actual: {safe_duration:.2f}s"
+            )
+
+        except ValueError as e:
+            self.status.set(f"Invalid target: {e}")
+
+    def update_result(self):
+        degrees = [
+            math.degrees(q) for q in self.angles
+        ]
+
+        text = "\n".join(
+            f"J{i+1}: {angle:8.2f}°"
+            for i, angle in enumerate(degrees)
+        )
+
+        self.result_label.config(text=text)
+
+    def home_robot(self):
+        self.is_moving = False
+        self.angles = [0.0] * 4
+        self.start_angles = self.angles.copy()
+        self.target_angles = self.angles.copy()
+
+        self.update_result()
+        self.status.set("Home pose published")
+
+    def publish_joints(self):
+        if not self.running:
+            return
+
+        # Update joint angles during trajectory
+        if self.is_moving:
+
+            elapsed = (
+                time.monotonic() - self.move_start_time
+            )
+
+            u = min(
+                1.0,
+                elapsed / self.move_duration
+            )
+
+            # Cubic smoothstep interpolation
+            s = 3 * u**2 - 2 * u**3
+
+            self.angles = [
+                start + s * (target - start)
+                for start, target in zip(
+                    self.start_angles,
+                    self.target_angles
+                )
+            ]
+
+            self.update_result()
+
+            if u >= 1.0:
+                self.is_moving = False
+                self.status.set(
+                    "Trajectory completed."
+                )
+
+        # Publish joint states to ROS 2
+        msg = JointState()
+
+        msg.header.stamp = (
+            self.node.get_clock().now().to_msg()
+        )
+
+        msg.name = self.joint_names
+        msg.position = self.angles.copy()
+
+        self.publisher.publish(msg)
+
+        # Update every 100 ms
+        self.root.after(100, self.publish_joints)
+
+    def close(self):
+        self.running = False
+        self.node.destroy_node()
+        rclpy.shutdown()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = IKControlGUI(root)
+    root.mainloop()
