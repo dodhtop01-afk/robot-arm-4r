@@ -23,3 +23,14 @@ log/
 .DS_Store
 core
 core.*
+
+# Temporary backup files
+*.save
+*_backup.py
+*_before_*.py
+*_before_*.urdf
+*_backup.urdf
+
+# Python cache
+__pycache__/
+*.pyc
